@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local dev credential store and app data — never commit
+data/*.json
+data/*.enc
+data/credentials.local
+!data/.gitkeep
+
+.DS_Store
