@@ -7,11 +7,13 @@ venv/
 *.egg-info/
 build/
 dist/
+data/conversations/
 
 # Local dev credential store and app data — never commit
 data/*.json
 data/*.enc
 data/credentials.local
 !data/.gitkeep
+
 
 .DS_Store

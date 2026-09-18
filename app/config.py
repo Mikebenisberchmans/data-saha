@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     @property
     def local_credential_store_file(self) -> Path:
         return self.app_data_dir / "credentials.local"
+    @property
+    def conversations_dir(self) -> Path:
+        return self.app_data_dir / "conversations"
 
     def ensure_data_dir(self) -> None:
         self.app_data_dir.mkdir(parents=True, exist_ok=True)

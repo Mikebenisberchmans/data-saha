@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from app.config import reload_settings
-from app.dependencies import get_source_repository, get_user_profile_repository
+from app.dependencies import (
+    get_conversation_store,
+    get_source_repository,
+    get_user_profile_repository,
+)
 
 
 @pytest.fixture
@@ -26,6 +30,8 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     reload_settings()
     get_source_repository.cache_clear()
     get_user_profile_repository.cache_clear()
+    get_conversation_store.cache_clear()
     yield tmp_path
     get_source_repository.cache_clear()
     get_user_profile_repository.cache_clear()
+    get_conversation_store.cache_clear()

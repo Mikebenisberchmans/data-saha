@@ -14,6 +14,7 @@ from functools import lru_cache
 from app.config import get_settings
 from app.core.credentials import build_credential_store
 from app.sources.models import UserProfile
+from app.memory.conversation import ConversationStore
 from app.sources.repository import SourceRepository, UserProfileRepository
 
 
@@ -34,6 +35,20 @@ def get_user_profile_repository() -> UserProfileRepository:
     settings.ensure_data_dir()
     return UserProfileRepository(profile_file=settings.user_profile_file)
 
+@lru_cache
+def get_conversation_store() -> ConversationStore:
+    settings = get_settings()
+    settings.ensure_data_dir()
+    return ConversationStore(conversations_dir=settings.conversations_dir)
+
+
+def get_default_session_id() -> str:
+    """The product has one continuous conversation per user (no multi-chat
+    UI), so we use a stable, deterministic session id per user rather than
+    a fresh random one per process — that's what actually makes
+    persistence across restarts meaningful."""
+    profile = get_current_user_profile()
+    return f"{profile.user_id}-main"
 
 def get_current_user_profile() -> UserProfile:
     """Single-user desktop app: there's exactly one local profile. Multi-

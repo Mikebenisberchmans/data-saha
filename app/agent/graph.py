@@ -1,32 +1,28 @@
 """
 LangGraph graph assembly.
 
-Phase 2 graph is intentionally minimal:
+Phase 3 graph:
 
-    START -> load_context -> conversation -> END
+    START -> load_context -> conversation -> summarizer -> END
 
-Source selection, tool execution, analysis, and the dashboard/report
-branches are added in later phases per the implementation roadmap; the
-node functions already take/return the full AgentState so wiring them in
-later is a graph-shape change, not a state-shape change.
-
-Multi-turn memory: a LangGraph `MemorySaver` checkpointer is used, keyed by
-`thread_id` (= our session_id), so the graph remembers prior turns within
-this process's lifetime. This is intentionally NOT the durable, summarized
-conversation memory described in the product spec (section 12-13) — that
-is Phase 3's job (disk persistence + summarizer node). Phase 3 will likely
-replace MemorySaver with a custom checkpointer or an explicit
-load/save-around-invoke pattern; nothing in this graph's shape depends on
-which one is used.
+Change from Phase 2: conversation persistence across process runs is now
+handled explicitly by ConversationStore + app/agent/runner.py, not by a
+LangGraph checkpointer. Phase 2 used an in-memory `MemorySaver`
+checkpointer keyed by thread_id for short-lived multi-turn memory within a
+single process; that's dropped here because (a) it didn't survive process
+restarts anyway, which the product needs, and (b) the summarizer needs to
+fully replace the message list (trim old messages), which doesn't map
+cleanly onto checkpointer + reducer semantics. See app/agent/state.py for
+the corresponding `messages` type change.
 """
 
 from __future__ import annotations
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.nodes.context import load_context
 from app.agent.nodes.conversation import conversation
+from app.agent.nodes.summarizer import summarizer
 from app.agent.state import AgentState
 
 
@@ -35,12 +31,14 @@ def build_graph():
 
     graph.add_node("load_context", load_context)
     graph.add_node("conversation", conversation)
+    graph.add_node("summarizer", summarizer)
 
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "conversation")
-    graph.add_edge("conversation", END)
+    graph.add_edge("conversation", "summarizer")
+    graph.add_edge("summarizer", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile()
 
 
 _compiled_graph = None
@@ -54,6 +52,6 @@ def get_graph():
 
 
 def reset_graph() -> None:
-    """Test helper — forces the graph (and its checkpointer) to be rebuilt."""
+    """Test helper — forces the graph to be rebuilt."""
     global _compiled_graph
     _compiled_graph = None
