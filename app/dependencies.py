@@ -16,7 +16,7 @@ from app.core.credentials import build_credential_store
 from app.sources.models import UserProfile
 from app.memory.conversation import ConversationStore
 from app.sources.repository import SourceRepository, UserProfileRepository
-
+from app.mcp.manager import MCPManager
 
 @lru_cache
 def get_source_repository() -> SourceRepository:
@@ -40,7 +40,12 @@ def get_conversation_store() -> ConversationStore:
     settings = get_settings()
     settings.ensure_data_dir()
     return ConversationStore(conversations_dir=settings.conversations_dir)
-
+@lru_cache
+def get_mcp_manager() -> MCPManager:
+    """One MCPManager for the process, backed by the same SourceRepository
+    the rest of the app uses — so connections are always built from
+    whatever sources are currently configured."""
+    return MCPManager(source_repository=get_source_repository())
 
 def get_default_session_id() -> str:
     """The product has one continuous conversation per user (no multi-chat
