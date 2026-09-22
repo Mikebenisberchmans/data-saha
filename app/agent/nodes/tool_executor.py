@@ -11,6 +11,17 @@ loop and produces the same output shape as the plain `conversation` node
 (full messages list + last_response), so downstream (summarizer) doesn't
 care which path a turn took.
 
+Phase 7 addition: before any tool call is actually executed, its arguments
+are checked for a SQL-shaped string (see _find_sql_argument_key). If found,
+it goes through app/analytics/sql_validator.py — a real validation layer,
+not just prompt instructions — before the MCP tool is ever called. A
+rejected query never reaches the MCP server; the rejection reason is fed
+back to the model as the tool's result, the same way a real execution
+error would be, so the model can react (retry with a safe query, or tell
+the user why it can't answer). This applies regardless of which MCP source
+or tool is involved — the validator doesn't know or care about provider,
+only about the SQL text itself.
+
 LangGraph's compiled graph is invoked synchronously (graph.invoke, used by
 app/agent/runner.py) but MCPManager's connect/discover/call methods are
 async (Phase 4). Rather than convert the whole graph to async, this node
@@ -27,6 +38,7 @@ import json
 from langchain_core.messages import AIMessage
 
 from app.agent.state import AgentState
+from app.analytics.sql_validator import validate_sql
 from app.core.logging import get_logger
 from app.dependencies import get_mcp_manager, get_source_repository
 from app.llm.groq_client import get_groq_client
@@ -42,6 +54,12 @@ MAX_TOOL_ITERATIONS = 5
 # names within one request.
 _TOOL_NAME_SEP = "__"
 
+# Argument key names commonly used by MCP tools that execute raw SQL.
+# Deliberately provider-agnostic — per product spec section 16/29, we never
+# assume a specific source exposes "execute_sql" specifically; we just
+# check whatever argument keys the ACTUAL discovered tool schema used.
+_SQL_ARGUMENT_KEYS = {"query", "sql", "statement", "sql_query", "sql_statement"}
+
 
 def _namespaced_name(source_id: str, tool_name: str) -> str:
     return f"{source_id}{_TOOL_NAME_SEP}{tool_name}"
@@ -50,6 +68,13 @@ def _namespaced_name(source_id: str, tool_name: str) -> str:
 def _split_namespaced_name(namespaced: str) -> tuple[str, str]:
     source_id, _, tool_name = namespaced.partition(_TOOL_NAME_SEP)
     return source_id, tool_name
+
+
+def _find_sql_argument_key(arguments: dict) -> str | None:
+    for key, value in arguments.items():
+        if key.lower() in _SQL_ARGUMENT_KEYS and isinstance(value, str):
+            return key
+    return None
 
 
 def _tool_info_to_groq_schema(tool: ToolInfo) -> dict:
@@ -92,7 +117,9 @@ def _build_system_prompt(state: AgentState, source_names: dict[str, str]) -> str
         "multiple tools, including more than once, before answering. Base "
         "your answer only on what the tools actually return — never "
         "invent numbers. If a tool call fails or returns no useful data, "
-        "say so plainly rather than guessing."
+        "say so plainly rather than guessing. If you write SQL, only "
+        "SELECT queries are permitted — any write or administrative "
+        "statement will be blocked before it reaches the database."
     )
     if summary:
         prompt += f"\n\nSummary of earlier parts of this conversation:\n{summary}"
@@ -197,6 +224,28 @@ async def _run_tool_loop_inner(
                 arguments = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 arguments = {}
+
+            sql_arg_key = _find_sql_argument_key(arguments)
+            if sql_arg_key:
+                validation = validate_sql(arguments[sql_arg_key])
+                if not validation.is_safe:
+                    logger.warning(
+                        "Blocked unsafe SQL for tool %s on source %s: %s",
+                        tool_name,
+                        source_id,
+                        validation.reason,
+                    )
+                    groq_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": (
+                                f"Query blocked by safety validation: "
+                                f"{validation.reason}"
+                            ),
+                        }
+                    )
+                    continue  # never reaches manager.call_tool
 
             result = await manager.call_tool(source_id, tool_name, arguments)
             content = result.error if result.is_error else result.content
