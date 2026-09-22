@@ -403,3 +403,146 @@ def test_non_sql_tool_arguments_are_not_touched_by_validator(source_and_state):
 
         manager.call_tool.assert_called_once_with(source.id, "list_tables", {})
         assert "sales and customers" in result["last_response"]
+# --- Phase 8: multi-source data normalization / cross-source analysis -----
+
+
+def test_cross_source_summary_injected_when_two_sources_queried(isolated_env, monkeypatch):
+    """When the model calls tools on two DIFFERENT sources within the same
+    turn, tool_executor must compute and inject a cross-source comparison
+    (Phase 8) before the model's final answer — proving the comparison was
+    actually computed in Python, not left to the model to eyeball two
+    separate blobs."""
+    from app.dependencies import get_source_repository
+
+    monkeypatch.setenv("DEFAULT_USER_DISPLAY_NAME", "Mike")
+    monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    from app.config import reload_settings
+
+    reload_settings()
+    reset_groq_client()
+
+    repo = get_source_repository()
+    sales = repo.create_source(
+        DataSourceCreate(
+            display_name="Sales Snowflake",
+            provider=ProviderType.SNOWFLAKE,
+            mcp_url="https://example.com/sales",
+            pat="pat-sales",
+            description="sales data",
+            business_domain="sales",
+        )
+    )
+    finance = repo.create_source(
+        DataSourceCreate(
+            display_name="Finance Snowflake",
+            provider=ProviderType.SNOWFLAKE,
+            mcp_url="https://example.com/finance",
+            pat="pat-finance",
+            description="finance data",
+            business_domain="finance",
+        )
+    )
+
+    state = {
+        "session_id": "s1",
+        "messages": [HumanMessage(content="Compare sales revenue with finance expenses")],
+        "user_display_name": "Mike",
+        "user_timezone": "UTC",
+        "preferred_language": "en",
+        "active_source_ids": [sales.id, finance.id],
+        "summary": "",
+        "last_response": None,
+    }
+
+    sales_tool = ToolInfo(source_id=sales.id, tool_name="execute_sql", description="")
+    finance_tool = ToolInfo(source_id=finance.id, tool_name="execute_sql", description="")
+
+    with patch("app.agent.nodes.tool_executor.get_mcp_manager") as mock_get_manager, \
+         patch("app.llm.groq_client.Groq") as MockGroq:
+        manager = MagicMock()
+        manager.discover_tools = AsyncMock(return_value=[sales_tool, finance_tool])
+        manager.disconnect = AsyncMock()
+
+        async def fake_call_tool(source_id, tool_name, arguments):
+            if source_id == sales.id:
+                return ToolCallResult(
+                    source_id=sales.id, tool_name="execute_sql",
+                    content=json.dumps({"columns": ["region", "revenue"], "rows": [["US", 1000], ["EU", 500]]}),
+                )
+            return ToolCallResult(
+                source_id=finance.id, tool_name="execute_sql",
+                content=json.dumps({"columns": ["quarter", "expenses"], "rows": [["Q4", 300]]}),
+            )
+
+        manager.call_tool = AsyncMock(side_effect=fake_call_tool)
+        mock_get_manager.return_value = manager
+
+        # First call: request both tools at once (one iteration, two calls)
+        sales_call = MagicMock()
+        sales_call.id = "call_1"
+        sales_call.function.name = _namespaced_name(sales.id, "execute_sql")
+        sales_call.function.arguments = json.dumps({"query": "SELECT revenue FROM sales"})
+
+        finance_call = MagicMock()
+        finance_call.id = "call_2"
+        finance_call.function.name = _namespaced_name(finance.id, "execute_sql")
+        finance_call.function.arguments = json.dumps({"query": "SELECT expenses FROM finance"})
+
+        first_response = MagicMock()
+        first_response.choices = [
+            MagicMock(message=MagicMock(content=None, tool_calls=[sales_call, finance_call]))
+        ]
+
+        captured_second_call_messages = {}
+
+        def _second_call(**kwargs):
+            captured_second_call_messages["messages"] = kwargs["messages"]
+            response = MagicMock()
+            response.choices = [
+                MagicMock(
+                    message=MagicMock(
+                        content="Sales revenue ($1,500) was well above finance expenses ($300).",
+                        tool_calls=None,
+                    )
+                )
+            ]
+            return response
+
+        MockGroq.return_value.chat.completions.create.side_effect = _make_sequenced_mock(
+            [first_response], _second_call
+        )
+
+        result = tool_executor(state)
+
+    assert "1,500" in result["last_response"] or "$1,500" in result["last_response"]
+
+    # The cross-source summary must have been injected as a system message
+    # BEFORE the final Groq call that produced the answer.
+    injected = [
+        m for m in captured_second_call_messages["messages"]
+        if m.get("role") == "system" and "Cross-source summary" in m.get("content", "")
+    ]
+    assert injected, "expected an injected cross-source summary system message"
+    assert sales.id in injected[0]["content"]
+    assert finance.id in injected[0]["content"]
+    assert "1500" in injected[0]["content"]  # computed sales total
+    assert "300" in injected[0]["content"]  # computed finance total
+
+    reset_groq_client()
+
+
+def _make_sequenced_mock(fixed_responses, final_callable):
+    """Returns 1st, 2nd, ... items from fixed_responses, then delegates to
+    final_callable for all subsequent calls (so we can both return canned
+    responses AND capture kwargs on the last call)."""
+    calls = {"n": 0}
+
+    def _side_effect(**kwargs):
+        idx = calls["n"]
+        calls["n"] += 1
+        if idx < len(fixed_responses):
+            return fixed_responses[idx]
+        return final_callable(**kwargs)
+
+    return _side_effect

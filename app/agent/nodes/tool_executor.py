@@ -14,13 +14,18 @@ care which path a turn took.
 Phase 7 addition: before any tool call is actually executed, its arguments
 are checked for a SQL-shaped string (see _find_sql_argument_key). If found,
 it goes through app/analytics/sql_validator.py — a real validation layer,
-not just prompt instructions — before the MCP tool is ever called. A
-rejected query never reaches the MCP server; the rejection reason is fed
-back to the model as the tool's result, the same way a real execution
-error would be, so the model can react (retry with a safe query, or tell
-the user why it can't answer). This applies regardless of which MCP source
-or tool is involved — the validator doesn't know or care about provider,
-only about the SQL text itself.
+not just prompt instructions — before the MCP tool is ever called.
+
+Phase 8 addition (product spec sections 10, 22): every successful tool
+result is normalized via app/analytics/dataframe.py. The LLM is fed a
+compact, structured summary of each result instead of the raw tool output,
+and once results from two or more distinct sources have come back, a
+computed cross-source comparison (totals per source, done in Python/pandas
+— never assumed to be a SQL join across sources) is injected into the
+conversation before the model gives its final answer. This is what lets
+"compare sales revenue from Snowflake with customer data from Redshift"
+style questions get an answer actually grounded in arithmetic done by us,
+not the model eyeballing two blobs.
 
 LangGraph's compiled graph is invoked synchronously (graph.invoke, used by
 app/agent/runner.py) but MCPManager's connect/discover/call methods are
@@ -38,6 +43,7 @@ import json
 from langchain_core.messages import AIMessage
 
 from app.agent.state import AgentState
+from app.analytics.dataframe import ToolResultFrame, combine_frames, summarize_frame, to_dataframe
 from app.analytics.sql_validator import validate_sql
 from app.core.logging import get_logger
 from app.dependencies import get_mcp_manager, get_source_repository
@@ -119,7 +125,11 @@ def _build_system_prompt(state: AgentState, source_names: dict[str, str]) -> str
         "invent numbers. If a tool call fails or returns no useful data, "
         "say so plainly rather than guessing. If you write SQL, only "
         "SELECT queries are permitted — any write or administrative "
-        "statement will be blocked before it reaches the database."
+        "statement will be blocked before it reaches the database. "
+        "Different sources cannot be joined with a single SQL query — "
+        "query each independently; if a cross-source summary has already "
+        "been computed for you, it will appear in the conversation as a "
+        "system note."
     )
     if summary:
         prompt += f"\n\nSummary of earlier parts of this conversation:\n{summary}"
@@ -147,9 +157,24 @@ async def _run_tool_loop(state: AgentState) -> tuple[list, str]:
         # the whole app runs inside one long-lived event loop (Phase 11's
         # async FastAPI handlers), this can go back to being a persistent
         # pool.
-        for sid in source_ids:
+        #
+        # Also important when a turn used MORE THAN ONE source (Phase 8):
+        # anyio ties cancel scopes to the enclosing asyncio Task, not to
+        # which connection's AsyncExitStack logically owns them — all
+        # scopes opened within this one asyncio.run() task share a single
+        # LIFO stack. Closing them in the same order they were opened
+        # (source_ids as-is) violates that ordering and raises a
+        # CancelledError that escapes uncaught (CancelledError is a
+        # BaseException, not an Exception, so a bare `except Exception`
+        # around this loop does NOT catch it) and crashes the whole graph
+        # node. Disconnecting in REVERSE order fixes it.
+        for sid in reversed(source_ids):
             try:
                 await manager.disconnect(sid)
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Disconnect for source %s was cancelled during cleanup", sid
+                )
             except Exception:
                 logger.warning("Error disconnecting source %s after turn", sid)
 
@@ -187,6 +212,13 @@ async def _run_tool_loop_inner(
     for msg in state["messages"]:
         role = "assistant" if msg.type == "ai" else "user"
         groq_messages.append({"role": role, "content": msg.content})
+
+    # Phase 8: every successfully-normalized tool result (across the whole
+    # loop, potentially spanning multiple iterations and multiple sources)
+    # is kept here so we can compute a cross-source comparison once we have
+    # data from 2+ distinct sources.
+    collected_frames: list[ToolResultFrame] = []
+    cross_source_injected = False
 
     final_text = ""
     for _ in range(MAX_TOOL_ITERATIONS):
@@ -248,14 +280,37 @@ async def _run_tool_loop_inner(
                     continue  # never reaches manager.call_tool
 
             result = await manager.call_tool(source_id, tool_name, arguments)
-            content = result.error if result.is_error else result.content
+
+            if result.is_error:
+                tool_message_content = result.error or ""
+            else:
+                # Phase 8: normalize into a DataFrame when the content is
+                # tabular, and feed the model a compact structured summary
+                # instead of the raw content — improves reasoning accuracy
+                # and is what makes cross-source combination possible.
+                frame = to_dataframe(result)
+                collected_frames.append(frame)
+                tool_message_content = summarize_frame(frame)
+
             groq_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": content or "",
+                    "content": tool_message_content or "",
                 }
             )
+
+        if not cross_source_injected:
+            cross_source_summary = combine_frames(collected_frames)
+            if cross_source_summary:
+                groq_messages.append(
+                    {"role": "system", "content": cross_source_summary}
+                )
+                cross_source_injected = True
+                logger.info(
+                    "Injected cross-source comparison for sources: %s",
+                    {f.source_id for f in collected_frames if f.df is not None},
+                )
     else:
         final_text = (
             "I gathered some data but wasn't able to finish reasoning about "

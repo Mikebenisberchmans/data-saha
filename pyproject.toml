@@ -13,9 +13,6 @@ dependencies = [
     "pydantic-settings>=2.4.0",
     "python-dotenv>=1.0.1",
     "cryptography>=43.0.0",
-
-    # --- Added in later phases (kept here so `pip install -e .` stays stable
-    #     as the project grows; unused imports are not present yet) ---
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
     "groq>=0.11.0",
