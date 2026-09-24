@@ -12,6 +12,23 @@ from app.dependencies import (
     get_user_profile_repository,
 )
 
+@pytest.fixture(autouse=True)
+def _fresh_settings_each_test():
+    """Re-reads settings from the (by-now-reverted) real environment at the
+    START of every test, isolated or not.
+
+    Without this, get_settings()'s module-level cache can leak across
+    tests: if test A calls reload_settings() (e.g. via the isolated_env
+    fixture, or directly) with GROQ_API_KEY/GROQ_MODEL set to fake test
+    values, that cached Settings object survives after test A's monkeypatch
+    reverts the env vars — nothing re-reads it. A later test B that never
+    asked for isolation (e.g. one asserting "GroqClient raises when
+    GROQ_API_KEY is absent") would then see test A's fake key instead of
+    a clean environment. Reloading here, before each test even starts (and
+    therefore before that test's own monkeypatch.setenv calls run), closes
+    that gap regardless of test order."""
+    reload_settings()
+    yield
 
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

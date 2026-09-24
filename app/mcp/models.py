@@ -42,3 +42,19 @@ class ConnectionHealth(BaseModel):
     source_id: str
     healthy: bool
     message: str | None = None
+class NormalizedToolResult(BaseModel):
+    """The normalized internal representation described in product spec
+    section 22: source_id, tool_name, columns, rows, metadata,
+    execution_time, error. Unlike app.analytics.dataframe.ToolResultFrame
+    (which wraps a pandas DataFrame for computation), this is the
+    plain-JSON, API/serialization-safe shape — what a dashboard or report
+    payload actually carries to the future frontend. `columns`/`rows` are
+    None when the underlying tool result wasn't tabular."""
+
+    source_id: str
+    tool_name: str
+    columns: list[str] | None = None
+    rows: list[list] | None = None
+    metadata: dict[str, Any] = {}
+    execution_time: float | None = None
+    error: str | None = None

@@ -10,6 +10,13 @@ to the LLM (via DataSourceConfig.selector_context() — never mcp_url or
 credential_ref). Tool discovery (already built in Phase 4) and actual MCP
 tool calls (Phase 6) happen in later nodes; this node only decides WHICH
 source(s), if any, are worth connecting to for the current message.
+
+Phase 9 refactor: the core selection logic is exposed as
+`select_sources_for_query`, a plain function taking a question string
+rather than the full graph AgentState, so it can be reused by
+app/dashboard/specification.py (which needs the same "which source(s)
+match this request" decision outside of the conversational graph).
+`source_selector` (the node) is now a thin adapter over it.
 """
 
 from __future__ import annotations
@@ -79,22 +86,23 @@ def _strip_json_fences(text: str) -> str:
     return text.strip()
 
 
-def source_selector(state: AgentState) -> dict:
+def select_sources_for_query(question: str, summary: str = "") -> list[str]:
+    """Core selection logic, independent of the conversational graph.
+    Used by the `source_selector` node below, and directly by
+    app/dashboard/specification.py (Phase 9) and (in a later phase)
+    app/reports/specification.py, which need the same source-matching
+    decision without going through AgentState/graph.invoke()."""
     profile = get_current_user_profile()
     repo = get_source_repository()
 
     candidates = _load_candidate_sources(profile.configured_data_sources, repo)
-    if not candidates:
-        return {"active_source_ids": []}
-
-    user_message = _latest_user_message(state)
-    if not user_message:
-        return {"active_source_ids": []}
+    if not candidates or not question:
+        return []
 
     candidates_payload = [s.selector_context() for s in candidates]
     user_content = (
-        f"User message:\n{user_message}\n\n"
-        f"Conversation summary so far (may be empty):\n{state.get('summary', '')}\n\n"
+        f"User message:\n{question}\n\n"
+        f"Conversation summary so far (may be empty):\n{summary}\n\n"
         f"Configured data sources:\n{json.dumps(candidates_payload, indent=2)}"
     )
 
@@ -123,4 +131,10 @@ def source_selector(state: AgentState) -> dict:
     if filtered:
         logger.info("Source selector chose: %s", filtered)
 
+    return filtered
+
+
+def source_selector(state: AgentState) -> dict:
+    question = _latest_user_message(state)
+    filtered = select_sources_for_query(question, state.get("summary", ""))
     return {"active_source_ids": filtered}

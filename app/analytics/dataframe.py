@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from app.mcp.models import ToolCallResult
-
+from app.mcp.models import NormalizedToolResult, ToolCallResult
 
 @dataclass
 class ToolResultFrame:
@@ -159,3 +159,30 @@ def combine_frames(frames: list[ToolResultFrame]) -> str | None:
             )
 
     return "\n".join(lines)
+def frame_to_normalized_result(
+    frame: ToolResultFrame, execution_time: float | None = None
+) -> NormalizedToolResult:
+    """Converts an internal ToolResultFrame (pandas-based, used for
+    computation) into the serializable NormalizedToolResult shape from
+    product spec section 22 — what actually gets returned to a caller
+    (e.g. a dashboard/report payload) rather than kept internal. When
+    `frame.df` is None (not tabular), columns/rows are None and the raw
+    text is preserved under metadata['raw_content'] instead."""
+    if frame.df is None:
+        return NormalizedToolResult(
+            source_id=frame.source_id,
+            tool_name=frame.tool_name,
+            columns=None,
+            rows=None,
+            metadata={"raw_content": frame.raw_content},
+            execution_time=execution_time,
+        )
+
+    return NormalizedToolResult(
+        source_id=frame.source_id,
+        tool_name=frame.tool_name,
+        columns=list(frame.df.columns),
+        rows=frame.df.values.tolist(),
+        metadata={},
+        execution_time=execution_time,
+    )
