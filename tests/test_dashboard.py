@@ -93,7 +93,7 @@ def test_generate_dashboard_malformed_spec_json_falls_back_gracefully(
 
     fake_tool = ToolInfo(source_id=source.id, tool_name="execute_sql", description="")
 
-    with patch("app.dashboard.specification.get_mcp_manager") as mock_get_manager, \
+    with patch("app.analytics.gathering.get_mcp_manager") as mock_get_manager, \
          patch("app.llm.groq_client.Groq") as MockGroq:
         manager = MagicMock()
         manager.discover_tools = AsyncMock(return_value=[fake_tool])
@@ -200,7 +200,7 @@ def test_generate_dashboard_full_happy_path(isolated_env, monkeypatch):
         "filters": ["region"],
     }
 
-    with patch("app.dashboard.specification.get_mcp_manager") as mock_get_manager, \
+    with patch("app.analytics.gathering.get_mcp_manager") as mock_get_manager, \
          patch("app.llm.groq_client.Groq") as MockGroq:
         manager = MagicMock()
         manager.discover_tools = AsyncMock(return_value=[fake_tool])

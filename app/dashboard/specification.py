@@ -3,51 +3,39 @@ Dashboard specification generation (product spec sections 18, 19, 24).
 
 The backend NEVER generates React/frontend code. It produces a structured
 DashboardSpecification (title, description, charts, metrics, filters) plus
-the normalized data each chart needs (NormalizedToolResult — spec section
+the normalized data each chart needs (NormalizedToolResult - spec section
 22), and hands that as JSON to whatever frontend renders it (a future
 React app using Plotly/ECharts/Recharts, per the product spec). This
 module has no knowledge of any charting library.
 
 `generate_dashboard()` is a plain callable, not something wired into the
-main conversational graph's default path — per spec section 24 ("Python
+main conversational graph's default path - per spec section 24 ("Python
 should expose backend capabilities... chat(), generate_dashboard(),
 generate_report()... do NOT write `if user_clicked_dashboard_button`").
 The future FastAPI `POST /dashboard` route (Phase 11) will simply call
 this directly.
 
-It reuses the same source-selection (Phase 5) and MCP tool-execution +
-SQL safety + data normalization (Phases 4, 6, 7, 8) building blocks the
-chat path uses, but ends in a structured JSON specification instead of
-natural-language prose.
+Phase 10 change: data gathering itself moved to app/analytics/gathering.py
+so app/reports/specification.py can reuse the exact same pipeline (spec
+section 21's "avoid querying the warehouse twice unnecessarily") - this
+module now only does dashboard-specific things: turning gathered data into
+a DashboardSpecification.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.agent.nodes.source_selector import select_sources_for_query
-from app.analytics.dataframe import (
-    ToolResultFrame,
-    combine_frames,
-    frame_to_normalized_result,
-    summarize_frame,
-    to_dataframe,
-)
-from app.analytics.sql_validator import validate_sql
+from app.analytics.dataframe import combine_frames, frame_to_normalized_result, summarize_frame
+from app.analytics.gathering import gather_datasets
 from app.core.logging import get_logger
-from app.dependencies import get_mcp_manager
 from app.llm.groq_client import get_groq_client
-from app.mcp.models import NormalizedToolResult, ToolInfo
+from app.mcp.models import NormalizedToolResult
 
 logger = get_logger(__name__)
-
-MAX_DATA_GATHERING_ITERATIONS = 4
-
-_SQL_ARGUMENT_KEYS = {"query", "sql", "statement", "sql_query", "sql_statement"}
 
 
 class ChartSpec(BaseModel):
@@ -107,142 +95,6 @@ DASHBOARD_SYSTEM_PROMPT = (
 )
 
 
-def _tool_schema(tool: ToolInfo) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": f"{tool.source_id}__{tool.tool_name}",
-            "description": tool.description or f"Tool on source {tool.source_id}",
-            "parameters": tool.input_schema or {"type": "object", "properties": {}},
-        },
-    }
-
-
-def _find_sql_argument_key(arguments: dict) -> str | None:
-    for key, value in arguments.items():
-        if key.lower() in _SQL_ARGUMENT_KEYS and isinstance(value, str):
-            return key
-    return None
-
-
-async def _gather_datasets_async(question: str) -> list[ToolResultFrame]:
-    """Reuses Phase 5 source selection and Phase 4/6/7 MCP tool calling +
-    SQL validation to gather data relevant to `question`, WITHOUT
-    generating any natural-language answer - that's the difference from
-    tool_executor.py's chat-path loop, which is why this isn't simply a
-    call into that module."""
-    source_ids = select_sources_for_query(question)
-    if not source_ids:
-        return []
-
-    manager = get_mcp_manager()
-    frames: list[ToolResultFrame] = []
-
-    try:
-        available_tools: list[ToolInfo] = []
-        for sid in source_ids:
-            try:
-                available_tools.extend(await manager.discover_tools(sid))
-            except Exception as exc:
-                logger.warning("Dashboard: tool discovery failed for %s: %s", sid, exc)
-
-        if not available_tools:
-            return []
-
-        groq_tools = [_tool_schema(t) for t in available_tools]
-        client = get_groq_client()
-        gather_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Call the available tools to gather the data needed to "
-                    "build a dashboard for this request. Call as many tools "
-                    "as needed across the available sources. Once you have "
-                    "gathered enough data, stop calling tools."
-                ),
-            },
-            {"role": "user", "content": question},
-        ]
-
-        for _ in range(MAX_DATA_GATHERING_ITERATIONS):
-            response = client.chat(
-                messages=gather_messages, tools=groq_tools, tool_choice="auto"
-            )
-            message = response.choices[0].message
-            tool_calls = getattr(message, "tool_calls", None)
-            if not tool_calls:
-                break
-
-            gather_messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-            )
-
-            for tc in tool_calls:
-                source_id, _, tool_name = tc.function.name.partition("__")
-                try:
-                    arguments = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-
-                sql_key = _find_sql_argument_key(arguments)
-                if sql_key:
-                    validation = validate_sql(arguments[sql_key])
-                    if not validation.is_safe:
-                        gather_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": (
-                                    f"Query blocked by safety validation: "
-                                    f"{validation.reason}"
-                                ),
-                            }
-                        )
-                        continue
-
-                result = await manager.call_tool(source_id, tool_name, arguments)
-                if not result.is_error:
-                    frame = to_dataframe(result)
-                    frames.append(frame)
-                    content = summarize_frame(frame)
-                else:
-                    content = result.error or ""
-                gather_messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": content or ""}
-                )
-    finally:
-        # Same LIFO-disconnect rule as tool_executor.py (Phase 8 bugfix):
-        # anyio cancel scopes must be closed in reverse order of opening
-        # within this single asyncio.run() task.
-        for sid in reversed(source_ids):
-            try:
-                await manager.disconnect(sid)
-            except asyncio.CancelledError:
-                logger.warning("Dashboard: disconnect for %s cancelled", sid)
-            except Exception:
-                logger.warning("Dashboard: error disconnecting %s", sid)
-
-    return frames
-
-
-def _gather_datasets(question: str) -> list[ToolResultFrame]:
-    return asyncio.run(_gather_datasets_async(question))
-
-
 def _parse_specification(raw_json: str) -> DashboardSpecification:
     cleaned = raw_json.strip()
     if cleaned.startswith("```"):
@@ -255,10 +107,7 @@ def _parse_specification(raw_json: str) -> DashboardSpecification:
 
 def _no_data_result(reason: str) -> DashboardResult:
     return DashboardResult(
-        specification=DashboardSpecification(
-            title="No data available",
-            description=reason,
-        ),
+        specification=DashboardSpecification(title="No data available", description=reason),
         datasets=[],
     )
 
@@ -269,7 +118,7 @@ def generate_dashboard(question: str) -> DashboardResult:
     DashboardSpecification grounded strictly in that gathered data (never
     invented columns/values), and returns it together with the normalized
     datasets a frontend needs to actually render it."""
-    frames = _gather_datasets(question)
+    frames, _source_ids = gather_datasets(question, purpose="build a dashboard")
     tabular_frames = [f for f in frames if f.df is not None and not f.df.empty]
 
     if not tabular_frames:

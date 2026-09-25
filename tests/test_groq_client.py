@@ -14,12 +14,27 @@ def _reset_client():
     reset_groq_client()
 
 
-def test_missing_api_key_raises():
+def test_missing_api_key_raises(isolated_env, monkeypatch):
+    # isolated_env chdir's away from the real .env; also explicitly clear
+    # these two in case they're set as real OS env vars (not just in
+    # .env), and force a fresh settings read from that clean state.
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    from app.config import reload_settings
+
+    reload_settings()
+
     with pytest.raises(GroqClientError, match="GROQ_API_KEY"):
         GroqClient(api_key=None, model="openai/gpt-oss-20b")
 
 
-def test_missing_model_raises():
+def test_missing_model_raises(isolated_env, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    from app.config import reload_settings
+
+    reload_settings()
+
     with pytest.raises(GroqClientError, match="GROQ_MODEL"):
         GroqClient(api_key="fake-key", model=None)
 
