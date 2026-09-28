@@ -66,7 +66,14 @@ class Settings(BaseSettings):
     sql_safety_mode: Literal["strict", "permissive"] = Field(
         default="strict", alias="SQL_SAFETY_MODE"
     )
-
+    cors_origins: str = Field(
+        default=(
+            "http://localhost:1420,http://127.0.0.1:1420,"
+            "http://localhost:5173,http://127.0.0.1:5173,"
+            "http://tauri.localhost,https://tauri.localhost,tauri://localhost"
+        ),
+        alias="CORS_ORIGINS",
+    )
     @property
     def sources_file(self) -> Path:
         return self.app_data_dir / "sources.json"

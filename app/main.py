@@ -1,40 +1,48 @@
 """
 FastAPI entrypoint.
 
-Phase 1: only app setup, config validation on startup, and a couple of
-introspection endpoints (health, current user, list sources) so the
-skeleton is runnable and testable end-to-end before the agent/MCP layers
-exist. Chat/dashboard/report routes are added starting Phase 11, per the
-implementation plan.
+Phase 11: wires in all the API routes described in product spec section
+23 - POST /chat, POST /dashboard, POST /report, GET /conversation/{id},
+and GET/POST/DELETE /sources plus /sources/{id}/health. Every route is a
+thin HTTP adapter over the backend capabilities already built in Phases
+1-10 (app.agent.runner.run_turn, app.dashboard.specification.
+generate_dashboard, app.reports.specification.generate_report, the
+SourceRepository); no business logic lives in this file or in app/api/.
+
+This module and everything under app/ must remain UI-independent - no
+knowledge of Tauri, React, microphones, or desktop packaging belongs here.
+The future Tauri app talks to this API exactly the same way scripts/*.py
+and the test suite do.
 
 Run with:
     python -m app.main
 or:
     uvicorn app.main:app --reload
-
-This module and everything under app/ must remain UI-independent — no
-knowledge of Tauri, React, microphones, or desktop packaging belongs here.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
+from app.api import (
+    routes_chat,
+    routes_conversation,
+    routes_dashboard,
+    routes_report,
+    routes_sources,
+)
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.dependencies import get_current_user_profile, get_source_repository
+from fastapi.middleware.cors import CORSMiddleware
 
 logger = get_logger(__name__)
 
-app = FastAPI(
-    title="AI Analytics Backend",
-    description="UI-independent backend for a desktop AI analytics/voice agent.",
-    version="0.1.0",
-)
 
-
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     settings = get_settings()
     settings.ensure_data_dir()
     # Touch the repositories so config problems (e.g. a bad credential
@@ -47,6 +55,29 @@ def on_startup() -> None:
         profile.display_name,
         len(profile.configured_data_sources),
     )
+    yield
+
+
+app = FastAPI(
+    title="AI Analytics Backend",
+    description="UI-independent backend for a desktop AI analytics/voice agent.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in get_settings().cors_origins.split(",") if o.strip()],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    expose_headers=["Content-Disposition"],  # lets the UI read the PDF filename
+)
+
+app.include_router(routes_chat.router)
+app.include_router(routes_sources.router)
+app.include_router(routes_dashboard.router)
+app.include_router(routes_report.router)
+app.include_router(routes_conversation.router)
 
 
 @app.get("/health")
@@ -59,14 +90,6 @@ def me() -> dict:
     """Returns the current user's profile (no secrets involved)."""
     profile = get_current_user_profile()
     return profile.model_dump()
-
-
-@app.get("/sources")
-def list_sources() -> list[dict]:
-    """Lists configured data sources. Never includes PATs — DataSourceConfig
-    has no secret field, so there is nothing to redact here."""
-    repo = get_source_repository()
-    return [s.model_dump() for s in repo.list_sources()]
 
 
 if __name__ == "__main__":

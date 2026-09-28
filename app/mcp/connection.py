@@ -141,7 +141,14 @@ class MCPConnection:
                 await self.connect()
             await self._session.list_tools()
             return ConnectionHealth(source_id=self._source.id, healthy=True)
-        except Exception as exc:
+        except BaseException as exc:
+            # BaseException, not Exception: a failed connection attempt to
+            # an unreachable host can surface as a GeneratorExit/anyio
+            # cancel-scope error during _safe_close()'s own cleanup (see
+            # that method's docstring) rather than a plain Exception.
+            # health_check()'s whole contract is "never crash the caller,
+            # always report health" — even an unusual BaseException here
+            # should degrade to an unhealthy result, not propagate.
             return ConnectionHealth(
                 source_id=self._source.id, healthy=False, message=str(exc)
             )
@@ -151,10 +158,26 @@ class MCPConnection:
         logger.info("Disconnected from MCP source id=%s", self._source.id)
 
     async def _safe_close(self) -> None:
+        """Closes the connection's AsyncExitStack defensively.
+
+        IMPORTANT: catches BaseException, not just Exception. When the
+        initial connection attempt fails fast (e.g. connecting to an
+        unreachable host), the mcp SDK's Streamable HTTP transport — an
+        async-generator-based context manager built on anyio task groups —
+        can raise a GeneratorExit-driven "attempted to exit cancel scope in
+        a different task" RuntimeError while being torn down, sometimes
+        wrapped in a BaseExceptionGroup. Neither is guaranteed to be a
+        plain Exception subclass, so a bare `except Exception` here can let
+        it escape uncaught, crashing whatever called connect()/health_check
+        even though the failure has already been logged and handled. This
+        is the same category of issue as the CancelledError fix in
+        app/agent/nodes/tool_executor.py's disconnect loop (Phase 8) — an
+        upstream async-cleanup edge case, not something fixable by
+        retrying or reordering our own calls."""
         if self._stack is not None:
             try:
                 await self._stack.aclose()
-            except Exception:
+            except BaseException:
                 logger.warning(
                     "Error while closing MCP connection id=%s", self._source.id
                 )
