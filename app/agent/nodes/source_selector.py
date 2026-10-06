@@ -17,6 +17,18 @@ rather than the full graph AgentState, so it can be reused by
 app/dashboard/specification.py (which needs the same "which source(s)
 match this request" decision outside of the conversational graph).
 `source_selector` (the node) is now a thin adapter over it.
+
+Bugfix (post-Phase 11, found in live testing): a bare follow-up like "in
+that how many were from india" — after an earlier turn like "how many
+users are there" — was being routed to `conversation` instead of
+`tool_executor`, because this node only ever looked at the SINGLE latest
+message plus the rolling summary (which is empty early in a conversation,
+before the summarizer has triggered). With zero context, "in that how
+many..." reads as a fragment with no obvious data need. Fixed by also
+passing a short window of recent message history to the selector, and by
+telling it explicitly to resolve references like "that"/"it"/"those
+users" against that history rather than judging the latest message in
+isolation.
 """
 
 from __future__ import annotations
@@ -32,12 +44,18 @@ from app.sources.repository import SourceRepository
 
 logger = get_logger(__name__)
 
+# How many prior messages (not counting the latest one) to show the
+# selector for resolving follow-up references. Kept small — this is a
+# routing decision, not the full conversation context tool_executor gets.
+RECENT_HISTORY_WINDOW = 6
+
 SOURCE_SELECTOR_SYSTEM_PROMPT = (
     "You are a routing component in an analytics assistant. Given the "
-    "user's latest message, a short conversation summary (if any), and a "
-    "list of configured data sources (each with an id, display name, "
-    "provider, description, and business domain), decide which source(s), "
-    "if any, are relevant to answering the message.\n\n"
+    "user's latest message, a short conversation summary (if any), recent "
+    "conversation history, and a list of configured data sources (each "
+    "with an id, display name, provider, description, and business "
+    "domain), decide which source(s), if any, are relevant to answering "
+    "the LATEST message.\n\n"
     "Rules:\n"
     "- If the message is general conversation, a greeting, or doesn't need "
     "any specific data source, return an empty list.\n"
@@ -48,6 +66,14 @@ SOURCE_SELECTOR_SYSTEM_PROMPT = (
     "between multiple sources of the same provider (e.g. 'Sales "
     "Snowflake' vs 'Finance Snowflake') — do not pick based on provider "
     "name alone.\n"
+    "- The latest message is often a FOLLOW-UP that only makes sense "
+    "given what came before — e.g. 'in that how many were from india' "
+    "after 'how many users are there'. Use the recent conversation "
+    "history to resolve words like 'that', 'it', 'those', or an implied "
+    "subject. If an earlier turn in the shown history needed a source, "
+    "and the latest message is clearly narrowing or continuing that same "
+    "question, select that source again even though the latest message "
+    "alone doesn't repeat the original keywords.\n"
     "- Only return ids that appear in the provided list. Never invent an "
     "id.\n\n"
     'Respond ONLY with a JSON object of the form {"source_ids": ["id1", '
@@ -60,6 +86,23 @@ def _latest_user_message(state: AgentState) -> str:
         if msg.type != "ai":
             return msg.content
     return ""
+
+
+def _recent_history_text(state: AgentState, window: int = RECENT_HISTORY_WINDOW) -> str:
+    """Renders up to `window` messages BEFORE the latest user message, as
+    plain "User: .../Assistant: ..." lines, for the selector to resolve
+    follow-up references against. Excludes the latest message itself
+    (that's passed separately as `question`)."""
+    messages = state["messages"]
+    if not messages:
+        return ""
+    history = messages[:-1] if messages else []
+    recent = history[-window:]
+    lines = []
+    for msg in recent:
+        role = "Assistant" if msg.type == "ai" else "User"
+        lines.append(f"{role}: {msg.content}")
+    return "\n".join(lines)
 
 
 def _load_candidate_sources(
@@ -86,12 +129,15 @@ def _strip_json_fences(text: str) -> str:
     return text.strip()
 
 
-def select_sources_for_query(question: str, summary: str = "") -> list[str]:
+def select_sources_for_query(
+    question: str, summary: str = "", recent_history: str = ""
+) -> list[str]:
     """Core selection logic, independent of the conversational graph.
     Used by the `source_selector` node below, and directly by
-    app/dashboard/specification.py (Phase 9) and (in a later phase)
-    app/reports/specification.py, which need the same source-matching
-    decision without going through AgentState/graph.invoke()."""
+    app/dashboard/specification.py and app/reports/specification.py,
+    which need the same source-matching decision without going through
+    AgentState/graph.invoke() (and so pass recent_history="" — those are
+    one-shot requests, not follow-ups within a running chat)."""
     profile = get_current_user_profile()
     repo = get_source_repository()
 
@@ -101,7 +147,9 @@ def select_sources_for_query(question: str, summary: str = "") -> list[str]:
 
     candidates_payload = [s.selector_context() for s in candidates]
     user_content = (
-        f"User message:\n{question}\n\n"
+        f"Recent conversation history (oldest first, may be empty):\n"
+        f"{recent_history or '(none)'}\n\n"
+        f"Latest user message (the one to route):\n{question}\n\n"
         f"Conversation summary so far (may be empty):\n{summary}\n\n"
         f"Configured data sources:\n{json.dumps(candidates_payload, indent=2)}"
     )
@@ -136,5 +184,6 @@ def select_sources_for_query(question: str, summary: str = "") -> list[str]:
 
 def source_selector(state: AgentState) -> dict:
     question = _latest_user_message(state)
-    filtered = select_sources_for_query(question, state.get("summary", ""))
+    history = _recent_history_text(state)
+    filtered = select_sources_for_query(question, state.get("summary", ""), history)
     return {"active_source_ids": filtered}

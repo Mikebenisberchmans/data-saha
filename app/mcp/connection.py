@@ -78,15 +78,39 @@ class MCPConnection:
             )
         except Exception as exc:
             await self._safe_close()
+            detail = self._describe_exception(exc)
             logger.error(
                 "Failed to connect to MCP source id=%s: %s",
                 self._source.id,
-                type(exc).__name__,
+                detail,
             )
             raise MCPConnectionError(
-                f"Failed to connect to source '{self._source.id}': {exc}"
+                f"Failed to connect to source '{self._source.id}': {detail}"
             ) from exc
 
+    @staticmethod
+    def _describe_exception(exc: Exception) -> str:
+        """Best-effort detailed description of a connection failure.
+
+        The mcp SDK's own exception str() is often generic (e.g. "Server
+        returned an error response") and drops the actual HTTP status code
+        or JSON-RPC error code/data that would explain WHY — e.g. a 401/403
+        (wrong or under-scoped token), a 404 (wrong URL — a common mistake
+        is pointing mcp_url at a project's Supabase API URL instead of the
+        actual MCP endpoint), or a non-MCP error page. This pulls out
+        whatever extra structured detail is available so it ends up in the
+        logs instead of being silently dropped."""
+        parts = [f"{type(exc).__name__}: {exc}"]
+        for attr in ("status_code", "code", "error", "data", "response"):
+            value = getattr(exc, attr, None)
+            if value is not None:
+                parts.append(f"{attr}={value!r}")
+        cause = exc.__cause__
+        if cause is not None:
+            parts.append(f"caused by {type(cause).__name__}: {cause}")
+        return " | ".join(parts)
+
+    
     async def discover_tools(self) -> list[ToolInfo]:
         """Per product spec section 7: never assume a fixed tool set.
         Whatever the server reports via list_tools() is the source of

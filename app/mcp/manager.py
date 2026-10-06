@@ -37,7 +37,28 @@ class MCPManager:
             return existing
 
         source = self._sources.get_source(source_id)
-        pat = self._sources.resolve_credential(source_id)
+        try:
+            pat = self._sources.resolve_credential(source_id)
+        except CredentialNotFoundError as exc:
+            # The most common cause by far: CREDENTIAL_STORE_BACKEND=env,
+            # where a PAT only lives in the memory of the process that
+            # registered it — a separate command (even moments later)
+            # never sees it. Second most common: LOCAL_CREDENTIAL_STORE_KEY
+            # was changed after the source was created, so the old
+            # encrypted value can no longer be decrypted. Spell both out
+            # rather than surfacing the bare KeyError, which is just the
+            # credential_ref and explains nothing on its own.
+            raise MCPConnectionError(
+                f"No stored credential for source '{source_id}'. If "
+                "CREDENTIAL_STORE_BACKEND=env, a PAT only persists for the "
+                "lifetime of the process that registered it — switch to "
+                "CREDENTIAL_STORE_BACKEND=local_file (with a "
+                "LOCAL_CREDENTIAL_STORE_KEY set) for it to survive across "
+                "commands/restarts. If you're already using local_file, "
+                "check LOCAL_CREDENTIAL_STORE_KEY hasn't changed since "
+                "this source was created — re-add the source if it has."
+            ) from exc
+
         connection = MCPConnection(source=source, pat=pat)
         await connection.connect()
         self._connections[source_id] = connection
